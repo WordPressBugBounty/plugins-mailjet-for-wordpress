@@ -245,7 +245,7 @@ class WooCommerceSettings {
 			'__EMAIL_TITLE__'  => __('Please confirm your subscription', 'mailjet-for-wordpress'),
 			'__EMAIL_HEADER__' => \sprintf(__('To receive newsletters from %s please confirm your subscription by clicking the following button:', 'mailjet-for-wordpress'), $wpUrl),
 			'__WP_URL__'       => $wpUrl,
-			'__CONFIRM_URL__'  => get_home_url() . '?subscribe=' . $subscribe . '&user_email=' . $user_email . '&first_name=' . $first_name . '&last_name=' . $last_name . '&mj_sub_woo_token=' . \sha1($subscribe . $user_email . $first_name . $last_name . MailjetSettings::getCryptoHash()),
+			'__CONFIRM_URL__'  => get_home_url() . '?subscribe=' . $subscribe . '&user_email=' . $user_email . '&first_name=' . $first_name . '&last_name=' . $last_name . '&mj_sub_woo_token=' . MailjetSettings::generateSubscriptionToken($subscribe . $user_email . $first_name . $last_name),
 			'__CLICK_HERE__'   => __('Yes, subscribe me to this list', 'mailjet-for-wordpress'),
 			'__FROM_NAME__'    => Mailjet::getOption('blogname'),
 			'__IGNORE__'       => __('If you received this email by mistake or don\'t wish to subscribe anymore, simply ignore this message.', 'mailjet-for-wordpress'),
@@ -806,9 +806,10 @@ class WooCommerceSettings {
         }
         // generate a random string as security
         try {
-            $securityKey = \bin2hex(\random_bytes(5));
-        } catch (Exception $e) {
-            $securityKey = (string) \mt_rand(10000, 99999);
+            $securityKey = \bin2hex(\random_bytes(16));
+        } catch (\Exception $e) {
+            // Never fall back to mt_rand(): it is not a CSPRNG.
+            $securityKey = wp_generate_password(32, \false, \false);
         }
         $mailId              = $this->register_sent_email($cart, $securityKey);
         $abandoned_cart_link = get_permalink(wc_get_page_id('cart')) . '?mj_action=track_cart&email_id=' . $mailId . '&key=' . $securityKey;
@@ -1249,11 +1250,19 @@ class WooCommerceSettings {
     private function addThankYouSubscription( $order ) {
         $scriptPath = plugins_url('/src/front/js/mailjet-front.js', MAILJET_PLUGIN_DIR . 'src');
         wp_register_script('mailjet-woo-ajax-subscribe', $scriptPath, array( 'jquery' ), \false, \true);
-        wp_localize_script('mailjet-woo-ajax-subscribe', 'mailjet', array( 'url' => admin_url('admin-ajax.php') ));
+        wp_localize_script(
+            'mailjet-woo-ajax-subscribe',
+            'mailjet',
+            array(
+				'url'   => admin_url('admin-ajax.php'),
+				'nonce' => wp_create_nonce('mj_ajax_subscribe'),
+			)
+        );
         wp_enqueue_script('mailjet-woo-ajax-subscribe');
         $text  = \stripslashes(Mailjet::getOption('mailjet_woo_banner_text'));
         $label = \stripslashes(Mailjet::getOption('mailjet_woo_banner_label'));
         set_query_var('orderId', $order->get_id());
+        set_query_var('orderKey', $order->get_order_key());
         set_query_var('text', ! empty($text) ? $text : __('Subscribe to our newsletter', 'mailjet-for-wordpress'));
         set_query_var('btnLabel', ! empty($label) ? $label : __('Subscribe now', 'mailjet-for-wordpress'));
         return load_template(MAILJET_FRONT_TEMPLATE_DIR . '/Subscription/subscriptionForm.php');
@@ -1272,28 +1281,26 @@ class WooCommerceSettings {
      * @return void
      */
     public function subscribeViaAjax() {
-        $post = array_map('sanitize_text_field', $_POST);
-        if (isset($post['orderId'])) {
-            $orderId = sanitize_text_field($post['orderId']);
-            $order   = wc_get_order($orderId);
-            $message = 'You\'v subscribed successfully to our mail list.';
-            $success = \true;
-            if (empty($order)) {
-                $message = 'Something went wrong.';
-                $success = \false;
-            } else {
-                $subscribe = $this->ajaxSubscription($order->get_billing_email(), $order->get_billing_first_name(), $order->get_billing_last_name());
-                wp_send_json_success($subscribe);
-            }
-            wp_send_json_success(
-                array(
-					'message' => $message,
-					'success' => $success,
-				)
-            );
-        } else {
+        $failure = array(
+			'message' => 'Something went wrong.',
+			'success' => \false,
+		);
+        if ( ! check_ajax_referer('mj_ajax_subscribe', 'nonce', \false)) {
+            wp_send_json_success($failure);
+        }
+        $post     = array_map('sanitize_text_field', wp_unslash($_POST));
+        $orderId  = isset($post['orderId']) ? absint($post['orderId']) : 0;
+        $orderKey = isset($post['orderKey']) ? (string) $post['orderKey'] : '';
+        if ($orderId === 0 || $orderKey === '') {
             wp_send_json_error();
         }
+        $order = wc_get_order($orderId);
+        // Only the customer holding the order key (it is part of the "order received" URL) may act on the order.
+        // A missing order and a wrong key get the same answer, so order IDs can't be probed.
+        if (empty($order) || ! \hash_equals((string) $order->get_order_key(), $orderKey)) {
+            wp_send_json_success($failure);
+        }
+        wp_send_json_success($this->ajaxSubscription($order->get_billing_email(), $order->get_billing_first_name(), $order->get_billing_last_name()));
     }
 
     /**
@@ -1317,7 +1324,8 @@ class WooCommerceSettings {
 			);
         }
         if ($this->mailjet_subscribe_confirmation_from_woo_form(1, $email, $fName, $lName)) {
-            $message = __('We have sent the newsletter subscription confirmation link to you: ', 'mailjet-for-wordpress') . $email . '. ' . __('To confirm your subscription you have to click on the provided link.', 'mailjet-for-wordpress');
+            // The address is deliberately left out of the response.
+            $message = __('Please confirm your subscription', 'mailjet-for-wordpress') . '. ' . __('To confirm your subscription you have to click on the provided link.', 'mailjet-for-wordpress');
             return array(
 				'success' => \true,
 				'message' => $message,
@@ -1384,7 +1392,7 @@ class WooCommerceSettings {
                     RIGHT JOIN `wp_mailjet_wc_abandoned_carts` AS cart ON email.abandoned_cart_id = cart.id
                     WHERE email.id = %d';
         $result = $wpdb->get_results($wpdb->prepare($query, $emailId));
-        if ($result && $result[0]->security_key === $key) {
+        if ($result && \is_string($key) && \hash_equals((string) $result[0]->security_key, $key)) {
             // check if the key corresponds to the one in DB
             $userId = $result[0]->user_id;
             if ($result[0]->user_type === 'REGISTERED') {
